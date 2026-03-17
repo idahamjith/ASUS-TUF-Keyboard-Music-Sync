@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""
+ASUS 1-Zone Keyboard Music Sync
+================================
+Syncs your ASUS ROG/TUF single-zone keyboard RGB lighting to audio in real time.
+Captures microphone input, analyzes amplitude & frequency, and drives the keyboard
+LED color via the OpenRGB HTTP API or direct ASUS ACPI WMI interface.
+
+Requirements:
+    pip install pyaudio numpy openrgb-python requests
+
+Optional (for direct WMI on Linux):
+    sudo apt install python3-dbus  # Linux only
+
+Usage:
+    python asus_music_sync.py [--mode openrgb|wmi] [--sensitivity 1.0] [--device 0]
+
+Controls (while running):
+    Ctrl+C  → Exit
+"""
+
+import argparse
+import colorsys
+import math
+import sys
+import time
+import threading
+import numpy as np
+
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+
+SAMPLE_RATE     = 44100      # Hz
+CHUNK_SIZE      = 1024       # Samples per frame
+CHANNELS        = 1
+SMOOTHING       = 0.65       # 0=snappy, 1=frozen
+BEAT_THRESHOLD  = 0.80       # Fraction of peak that triggers a "beat" flash
+IDLE_TIMEOUT    = 2.0        # Seconds of silence before idle breathe animation
+UPDATE_INTERVAL = 0.016      # ~60fps update rate
+
+# OpenRGB defaults
+OPENRGB_HOST    = "127.0.0.1"
+OPENRGB_PORT    = 6742
+
+# Color stops: (normalized_amplitude 0-1) → (H, S, V) in HSV
+# Full spectrum: deep violet → cyan → green → yellow → orange → red
+COLOR_STOPS = [
+    (0.00, (0.75, 0.7, 0.08)),   # deep violet (near silence)
+    (0.10, (0.70, 0.9, 0.25)),   # violet
+    (0.22, (0.58, 1.0, 0.55)),   # cyan-blue
+    (0.35, (0.50, 1.0, 0.80)),   # cyan
+    (0.48, (0.38, 1.0, 0.90)),   # teal-green
+    (0.60, (0.28, 1.0, 0.95)),   # green
+    (0.72, (0.16, 1.0, 1.00)),   # yellow-green → yellow
+    (0.84, (0.08, 1.0, 1.00)),   # amber-orange
+    (0.93, (0.03, 1.0, 1.00)),   # orange-red
+    (1.00, (0.00, 1.0, 1.00)),   # pure red
+]
+
+# ─── COLOR UTILITIES ─────────────────────────────────────────────────────────
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+def amplitude_to_rgb(amp: float, beat: bool = False, norm_amp: float = 0.0) -> tuple[int, int, int]:
+    """Map normalized amplitude [0,1] to an RGB tuple."""
+    amp = max(0.0, min(1.0, amp))
+
+    # Find surrounding stops
+    h = s = v = 0.0
+    for i in range(len(COLOR_STOPS) - 1):
+        a0, hsv0 = COLOR_STOPS[i]
+        a1, hsv1 = COLOR_STOPS[i + 1]
+        if a0 <= amp <= a1:
+            t = (amp - a0) / (a1 - a0)
+            h = lerp(hsv0[0], hsv1[0], t)
+            s = lerp(hsv0[1], hsv1[1], t)
+            v = lerp(hsv0[2], hsv1[2], t)
+            break
+
+    if beat:
+        v = min(1.0, v * 1.5)
+        s = max(0.0, s - 0.45)   # desaturate toward white for a "flash" effect
+
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return int(r * 255), int(g * 255), int(b * 255)
+
+def breathe_color(t: float) -> tuple[int, int, int]:
+    """Idle animation — slow hue rotation with gentle breathing brightness."""
+    hue = (t * 0.04) % 1.0          # full hue cycle every ~25 seconds
+    v   = (math.sin(t * 0.8) + 1) / 2 * 0.35 + 0.05
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.95, v)
+    return int(r * 255), int(g * 255), int(b * 255)
+
+# ─── KEYBOARD BACKENDS ───────────────────────────────────────────────────────
+
+class OpenRGBBackend:
+    """Control keyboard via OpenRGB SDK server (cross-platform)."""
+
+    def __init__(self, host=OPENRGB_HOST, port=OPENRGB_PORT):
+        try:
+            from openrgb import OpenRGBClient
+            from openrgb.utils import RGBColor
+            self._Color = RGBColor
+            self.client = OpenRGBClient(host, port)
+            self.client.connect()
+            # Find first keyboard device
+            self.device = None
+            for dev in self.client.devices:
+                if dev.type.name.lower() in ("keyboard",):
+                    self.device = dev
+                    break
+            if self.device is None:
+                # Fallback: use first device
+                self.device = self.client.devices[0]
+            print(f"[OpenRGB] Connected → {self.device.name}")
+        except ImportError:
+            print("[ERROR] openrgb-python not installed: pip install openrgb-python")
+            sys.exit(1)
+        except Exception as e:
+            print(f"[ERROR] Cannot connect to OpenRGB server at {host}:{port}\n"
+                  f"        Make sure OpenRGB is running with SDK server enabled.\n"
+                  f"        Details: {e}")
+            sys.exit(1)
+
+    def set_color(self, r: int, g: int, b: int):
+        try:
+            self.device.set_color(self._Color(r, g, b))
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.client.disconnect()
+        except Exception:
+            pass
+
+
+class WMIBackend:
+    """
+    Direct ASUS ACPI WMI backend (Linux only, requires root or proper udev rules).
+    Works with ASUS ROG/TUF laptops via the asus-nb-wmi kernel module.
+    
+    Keyboard LED path: /sys/class/leds/asus::kbd_backlight/
+    For RGB-capable models: uses dbus com.asus.AURA or sysfs RGB node.
+    """
+
+    def __init__(self):
+        import os
+        # Standard backlight path (brightness only, not RGB)
+        self.backlight_path = "/sys/class/leds/asus::kbd_backlight/brightness"
+        # RGB path — varies by model
+        self.rgb_paths = [
+            "/sys/devices/platform/asus-nb-wmi/leds/asus::kbd_backlight/device/leds",
+            "/sys/class/leds/asus_rgb::/",
+        ]
+        if not os.path.exists(self.backlight_path):
+            print("[WARN] WMI: Standard backlight path not found. Trying RGB sysfs nodes.")
+        # Try to find aura control
+        try:
+            import dbus
+            self.bus = dbus.SystemBus()
+            self.use_dbus = True
+            print("[WMI] Using D-Bus AURA interface")
+        except ImportError:
+            self.use_dbus = False
+            print("[WMI] D-Bus unavailable; using sysfs brightness (grayscale only)")
+
+    def set_color(self, r: int, g: int, b: int):
+        import os
+        if self.use_dbus:
+            self._dbus_set(r, g, b)
+        else:
+            # Fallback: map to brightness
+            brightness = int(max(r, g, b) / 255 * 3)  # 0-3
+            try:
+                with open(self.backlight_path, "w") as f:
+                    f.write(str(brightness))
+            except PermissionError:
+                print("[ERROR] Permission denied. Run as root or set udev rules.")
+                sys.exit(1)
+
+    def _dbus_set(self, r, g, b):
+        try:
+            import dbus
+            obj = self.bus.get_object("com.asus.AURA", "/com/asus/AURA")
+            iface = dbus.Interface(obj, "com.asus.AURA")
+            iface.SetColor(0, r, g, b)   # zone 0 = keyboard
+        except Exception:
+            pass
+
+    def close(self):
+        pass
+
+
+class FakeBackend:
+    """Terminal preview backend — prints colored blocks to stdout."""
+
+    def set_color(self, r: int, g: int, b: int):
+        # ANSI 24-bit color block
+        bar = "█" * 40
+        sys.stdout.write(f"\r\033[38;2;{r};{g};{b}m{bar}\033[0m  RGB({r:3d},{g:3d},{b:3d})")
+        sys.stdout.flush()
+
+    def close(self):
+        print()
+
+# ─── AUDIO CAPTURE ───────────────────────────────────────────────────────────
+
+class AudioCapture:
+    def __init__(self, device_index=None, sensitivity=1.0):
+        try:
+            import sounddevice as sd
+        except ImportError:
+            print("[ERROR] sounddevice not installed: pip install sounddevice")
+            import sys; sys.exit(1)
+
+        import threading
+        self.sd = sd
+        self.sensitivity = sensitivity
+        self.chunk = CHUNK_SIZE
+        self._buffer = np.zeros(CHUNK_SIZE, dtype=np.float32)
+        self._lock = threading.Lock()
+
+        # List devices
+        print("\nAvailable audio input devices:")
+        devs = sd.query_devices()
+        for i, d in enumerate(devs):
+            if d["max_input_channels"] > 0:
+                print(f"  [{i}] {d['name']}")
+        print()
+
+        if device_index is not None:
+            dev = sd.query_devices(device_index)
+        else:
+            dev = sd.query_devices(kind="input")
+
+        self.channels = min(int(dev["max_input_channels"]), 2)
+        self.rate = int(dev["default_samplerate"])
+        name = dev["name"]
+
+        def callback(indata, frames, time_info, status):
+            mono = indata[:, 0].copy()
+            with self._lock:
+                self._buffer = mono[-CHUNK_SIZE:]
+
+        self.stream = sd.InputStream(
+            device=device_index,
+            channels=self.channels,
+            samplerate=self.rate,
+            blocksize=CHUNK_SIZE,
+            dtype="float32",
+            callback=callback,
+        )
+        self.stream.start()
+        print(f"[Audio] Capturing from: {name} ({self.channels}ch @ {self.rate}Hz)")
+
+    def read_amplitude(self) -> float:
+        """Return normalized RMS amplitude [0, 1]."""
+        try:
+            with self._lock:
+                data = self._buffer.copy()
+            rms = float(np.sqrt(np.mean(data ** 2)))
+            return min(1.0, rms * self.sensitivity * 8.0)
+        except Exception:
+            return 0.0
+
+    def close(self):
+        self.stream.stop()
+        self.stream.close()
+
+# ─── MAIN SYNC LOOP ──────────────────────────────────────────────────────────
+
+class MusicSync:
+    def __init__(self, backend, audio, smoothing=SMOOTHING):
+        self.backend  = backend
+        self.audio    = audio
+        self.smoothing = smoothing
+        self._running = False
+
+        self.smooth_amp  = 0.0
+        self.peak        = 0.01
+        self.sr = self.sg = self.sb = 0.0
+        self.peak_decay  = 0.992
+        self.last_active = time.time()
+
+    def run(self):
+        self._running = True
+        print("🎵 Music sync running — press Ctrl+C to stop\n")
+        try:
+            while self._running:
+                raw_amp = self.audio.read_amplitude()
+
+                # Dynamic peak tracking
+                if raw_amp > self.peak:
+                    self.peak = raw_amp
+                else:
+                    self.peak *= self.peak_decay
+                self.peak = max(self.peak, 0.01)
+
+                # Normalize against rolling peak
+                norm_amp = raw_amp / self.peak
+
+                # Exponential smoothing
+                self.smooth_amp = (
+                    self.smoothing * self.smooth_amp +
+                    (1 - self.smoothing) * norm_amp
+                )
+
+                beat = norm_amp > BEAT_THRESHOLD
+
+                if raw_amp > 0.005:
+                    self.last_active = time.time()
+
+                if time.time() - self.last_active > IDLE_TIMEOUT:
+                    tr, tg, tb = breathe_color(time.time())
+                else:
+                    tr, tg, tb = amplitude_to_rgb(self.smooth_amp, beat, norm_amp)
+
+                # Smooth the RGB output itself for silky transitions
+                self.sr = self.sr * 0.75 + tr * 0.25
+                self.sg = self.sg * 0.75 + tg * 0.25
+                self.sb = self.sb * 0.75 + tb * 0.25
+
+                self.backend.set_color(int(self.sr), int(self.sg), int(self.sb))
+                time.sleep(UPDATE_INTERVAL)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.backend.set_color(0, 0, 30)   # dim blue on exit
+            time.sleep(0.1)
+            self.audio.close()
+            self.backend.close()
+            print("\n✋ Stopped.")
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ASUS 1-Zone Keyboard Music Sync"
+    )
+    parser.add_argument(
+        "--mode", choices=["openrgb", "wmi", "terminal"],
+        default="terminal",
+        help="Backend: 'openrgb' (recommended), 'wmi' (Linux root), 'terminal' (preview)"
+    )
+    parser.add_argument(
+        "--device", type=int, default=None,
+        help="Audio input device index (see list on startup)"
+    )
+    parser.add_argument(
+        "--sensitivity", type=float, default=1.0,
+        help="Amplitude multiplier (default 1.0, increase for quiet rooms)"
+    )
+    parser.add_argument(
+        "--smoothing", type=float, default=SMOOTHING,
+        help="Smoothing factor 0-1 (0=snappy, 0.9=slow, default 0.65)"
+    )
+    parser.add_argument(
+        "--openrgb-host", default=OPENRGB_HOST,
+        help=f"OpenRGB server host (default: {OPENRGB_HOST})"
+    )
+    parser.add_argument(
+        "--openrgb-port", type=int, default=OPENRGB_PORT,
+        help=f"OpenRGB server port (default: {OPENRGB_PORT})"
+    )
+    args = parser.parse_args()
+
+    print("=" * 52)
+    print("  ASUS 1-Zone Keyboard Music Sync")
+    print("=" * 52)
+    print(f"  Mode        : {args.mode}")
+    print(f"  Sensitivity : {args.sensitivity}")
+    print(f"  Smoothing   : {args.smoothing}")
+    print("=" * 52 + "\n")
+
+    # Init backend
+    if args.mode == "openrgb":
+        backend = OpenRGBBackend(args.openrgb_host, args.openrgb_port)
+    elif args.mode == "wmi":
+        backend = WMIBackend()
+    else:
+        backend = FakeBackend()
+
+    # Init audio
+    audio = AudioCapture(device_index=args.device, sensitivity=args.sensitivity)
+
+    # Run
+    sync = MusicSync(backend, audio, smoothing=args.smoothing)
+    sync.run()
+
+
+if __name__ == "__main__":
+    main()
